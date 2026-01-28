@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Live SSD OCR → Excel</title>
+  <style>
+    body { font-family: system-ui,-apple-system,Arial; margin: 16px; }
+    .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
+    .camWrap { position: relative; width: 360px; max-width: 100%; }
+    video { width: 100%; border-radius: 12px; border:1px solid #ddd; }
+    .roi {
+      position:absolute; inset:0;
+      pointer-events:none;
+      display:flex; align-items:center; justify-content:center;
+    }
+    .frame {
+      width: 78%;
+      height: 38%;
+      border: 3px solid rgba(255,255,255,.9);
+      border-radius: 12px;
+      box-shadow: 0 0 0 9999px rgba(0,0,0,.35);
+    }
+    .controls { display:flex; gap:10px; flex-wrap:wrap; margin:10px 0; }
+    button {
+      padding:10px 14px; border:0; border-radius:10px;
+      background:#111; color:#fff; cursor:pointer;
+    }
+    button.secondary { background:#444; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    .status { margin: 8px 0; color:#333; }
+    table { border-collapse: collapse; width: min(900px, 100%); }
+    th, td { border:1px solid #ddd; padding:8px; font-size:14px; }
+    th { background:#f6f6f6; text-align:left; }
+    td .mini { font-size: 12px; color:#666; }
+    .pill { display:inline-block; padding:4px 8px; border-radius:999px; background:#eef; margin-right:6px; font-size:12px; }
+    .small { font-size:12px; color:#666; line-height:1.4; max-width: 520px;}
+    canvas { display:none; }
+    pre { white-space: pre-wrap; background:#f6f6f6; padding:10px; border-radius:10px; max-width: 520px; }
+  </style>
+</head>
+<body>
+  <h1>라이브 OCR (SSD 라벨) → 표 누적 → 엑셀 다운로드</h1>
+  <div class="small">
+    ROI(흰 사각 프레임)에 <b>시리얼/PN/용량</b>이 보이도록 맞추면, 일정 간격으로 OCR 수행 후 자동으로 표에 추가됩니다.
+    <br/>정확도는 조명/반사/초점에 크게 좌우됩니다(가까이, 반사 최소화, 글씨 선명하게).
+  </div>
+
+  <div class="row">
+    <div class="camWrap">
+      <video id="video" autoplay playsinline></video>
+      <div class="roi"><div class="frame"></div></div>
+      <canvas id="canvas"></canvas>
+
+      <div class="controls">
+        <button id="btnStart">카메라 시작</button>
+        <button id="btnStop" class="secondary" disabled>중지</button>
+        <button id="btnToggle" class="secondary" disabled>자동인식 ON</button>
+        <button id="btnAdd" class="secondary" disabled>현재 결과 추가</button>
+      </div>
+
+      <div class="status" id="status">대기중…</div>
+      <div>
+        <span class="pill">추출된 값</span>
+        <span id="liveFields"></span>
+      </div>
+      <pre id="rawText">(원문 OCR 텍스트가 여기에 표시됩니다)</pre>
+    </div>
+
+    <div style="min-width:320px; flex: 1;">
+      <div class="controls">
+        <button id="btnCopyRow" class="secondary" disabled>마지막 행 복사(TSV)</button>
+        <button id="btnDownload" disabled>엑셀(.xlsx) 다운로드</button>
+        <button id="btnClear" class="secondary">전체 삭제</button>
+      </div>
+
+      <table id="tbl">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Serial Number</th>
+            <th>Capacity</th>
+            <th>Part Number</th>
+            <th>Timestamp</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+
+      <div class="small" style="margin-top:10px;">
+        팁: 엑셀에 바로 붙여넣기 원하면 “마지막 행 복사(TSV)”를 누르고 엑셀에 붙여넣으면 열이 나뉩니다.
+      </div>
+    </div>
+  </div>
+
+  <!-- OCR: Tesseract.js -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <!-- Excel export: SheetJS -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.19.3/dist/xlsx.full.min.js"></script>
+
+  <script>
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const statusEl = document.getElementById("status");
+    const rawTextEl = document.getElementById("rawText");
+    const liveFieldsEl = document.getElementById("liveFields");
+    const tbody = document.querySelector("#tbl tbody");
+
+    const btnStart = document.getElementById("btnStart");
+    const btnStop = document.getElementById("btnStop");
+    const btnToggle = document.getElementById("btnToggle");
+    const btnAdd = document.getElementById("btnAdd");
+    const btnDownload = document.getElementById("btnDownload");
+    const btnClear = document.getElementById("btnClear");
+    const btnCopyRow = document.getElementById("btnCopyRow");
+
+    let stream = null;
+    let autoOn = false;
+
+    // OCR worker (재사용: 성능/메모리 중요)
+    let worker = null;
+    let ocrBusy = false;
+    let lastOcrAt = 0;
+
+    // 최신 추출값(라이브)
+    let live = { serial:null, capacity:null, partNumber:null, raw:"" };
+
+    // 누적 데이터
+    const rows = [];
+
+    // ---- 패턴 파서(라벨/박스에 따라 커스터마이즈 추천) ----
+    function normalize(text) {
+      return text.replace(/[|]/g,"I").replace(/\s+/g," ").trim();
+    }
+
+    function parseSSDInfo(text) {
+      const t = normalize(text);
+
+      // 용량: 120GB/128GB/256GB/512GB/1TB/2TB 등
+      const cap = t.match(/\b(\d{2,4})\s?(GB|TB)\b/i);
+
+      // Serial: SN, S/N, SERIAL
+      const sn = t.match(/\b(S\/?N|SN|SERIAL|SER\.?)\s*[:#]?\s*([A-Z0-9\-]{6,})\b/i)
+              || t.match(/\b([A-Z0-9]{8,})\b/i); // fallback: 길게 나온 토큰(위험: 오탐 가능)
+
+      // Part Number: PN, P/N, PART NO
+      const pn = t.match(/\b(P\/?N|PN|PART\s?NO\.?)\s*[:#]?\s*([A-Z0-9\-]{4,})\b/i);
+
+      // fallback가 sn로 잡는 것 최소화: 명시 키워드 우선
+      let serial = null;
+      if (sn) {
+        serial = sn[2] ? sn[2] : sn[1];
+        // 너무 흔한 단어/짧은 값 제거
+        if (serial && serial.length < 8) serial = null;
+      }
+
+      return {
+        serial,
+        capacity: cap ? `${cap[1]}${cap[2].toUpperCase()}` : null,
+        partNumber: pn ? pn[2] : null,
+        raw: text
+      };
+    }
+
+    // ---- ROI 캡처 + 전처리(간단 이진화) ----
+    function captureROI() {
+      const vw = video.videoWidth, vh = video.videoHeight;
+      if (!vw || !vh) return null;
+
+      // ROI: 화면 중앙 (프레임과 동일 비율로)
+      const roiW = Math.floor(vw * 0.78);
+      const roiH = Math.floor(vh * 0.38);
+      const roiX = Math.floor((vw - roiW) / 2);
+      const roiY = Math.floor((vh - roiH) / 2);
+
+      canvas.width = roiW;
+      canvas.height = roiH;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      ctx.drawImage(video, roiX, roiY, roiW, roiH, 0, 0, roiW, roiH);
+
+      // 간단 전처리: grayscale + threshold (라벨 글씨 대비 향상)
+      const img = ctx.getImageData(0,0,roiW,roiH);
+      const data = img.data;
+      const thr = 150; // 환경 따라 130~180 조정
+      for (let i=0;i<data.length;i+=4) {
+        const gray = data[i]*0.3 + data[i+1]*0.59 + data[i+2]*0.11;
+        const v = gray > thr ? 255 : 0;
+        data[i]=data[i+1]=data[i+2]=v;
+      }
+      ctx.putImageData(img,0,0);
+
+      return canvas.toDataURL("image/png");
+    }
+
+    function renderLive() {
+      const parts = [];
+      if (live.serial) parts.push(`<span class="pill">SN: ${live.serial}</span>`);
+      if (live.capacity) parts.push(`<span class="pill">CAP: ${live.capacity}</span>`);
+      if (live.partNumber) parts.push(`<span class="pill">PN: ${live.partNumber}</span>`);
+      if (!parts.length) parts.push(`<span class="mini">추출된 값 없음</span>`);
+      liveFieldsEl.innerHTML = parts.join(" ");
+      btnAdd.disabled = !(live.serial || live.capacity || live.partNumber);
+    }
+
+    function addRowFromLive() {
+      const ts = new Date();
+      const row = {
+        serial: live.serial || "",
+        capacity: live.capacity || "",
+        partNumber: live.partNumber || "",
+        timestamp: ts.toISOString()
+      };
+
+      // 중복 방지(같은 SN+PN+CAP 연속 인식 시)
+      const last = rows[rows.length-1];
+      if (last && last.serial===row.serial && last.capacity===row.capacity && last.partNumber===row.partNumber) {
+        statusEl.textContent = "같은 값이 연속으로 인식되어 추가하지 않았습니다.";
+        return;
+      }
+
+      rows.push(row);
+      const idx = rows.length;
+
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${idx}</td>
+        <td>
+          ${escapeHtml(row.serial)}
+          <div class="mini"><button data-copy="${escapeAttr(row.serial)}" class="secondary" style="padding:6px 10px;border-radius:8px;">복사</button></div>
+        </td>
+        <td>
+          ${escapeHtml(row.capacity)}
+          <div class="mini"><button data-copy="${escapeAttr(row.capacity)}" class="secondary" style="padding:6px 10px;border-radius:8px;">복사</button></div>
+        </td>
+        <td>
+          ${escapeHtml(row.partNumber)}
+          <div class="mini"><button data-copy="${escapeAttr(row.partNumber)}" class="secondary" style="padding:6px 10px;border-radius:8px;">복사</button></div>
+        </td>
+        <td>${escapeHtml(row.timestamp)}</td>
+      `;
+      tbody.appendChild(tr);
+
+      btnDownload.disabled = rows.length === 0;
+      btnCopyRow.disabled = rows.length === 0;
+      statusEl.textContent = `행 추가됨 (#${idx})`;
+    }
+
+    function escapeHtml(s){ return (s||"").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+    function escapeAttr(s){ return escapeHtml(s).replace(/"/g,'&quot;'); }
+
+    // ---- OCR 루프 ----
+    async function ensureWorker() {
+      if (worker) return;
+      worker = await Tesseract.createWorker("eng", 1, {
+        logger: m => {
+          if (m.status === "recognizing text") {
+            statusEl.textContent = `OCR… ${(m.progress*100).toFixed(0)}%`;
+          }
+        }
+      });
+      // 라벨은 숫자/대문자 중심이라 whitelist 주면 오탐 줄어듦(필요 시 조정)
+      await worker.setParameters({
+        tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-/:# .",
+      });
+    }
+
+    async function tick() {
+      if (!autoOn) return;
+
+      const now = Date.now();
+      const intervalMs = 1400; // 자동 인식 간격(성능/발열에 따라 1000~2500 권장)
+      if (ocrBusy || (now - lastOcrAt) < intervalMs) {
+        requestAnimationFrame(tick);
+        return;
+      }
+
+      const img = captureROI();
+      if (!img) { requestAnimationFrame(tick); return; }
+
+      try {
+        ocrBusy = true;
+        lastOcrAt = now;
+        await ensureWorker();
+        const res = await worker.recognize(img);
+        const text = (res.data.text || "").trim();
+
+        rawTextEl.textContent = text || "(인식된 텍스트 없음)";
+        const parsed = parseSSDInfo(text);
+
+        live = { ...parsed, raw: text };
+        renderLive();
+
+        // 자동 추가 조건: (SN 또는 PN) + 용량 중 2개 이상 잡히면 자동으로 행 추가
+        const score = [live.serial, live.partNumber, live.capacity].filter(Boolean).length;
+        if (score >= 2) {
+          addRowFromLive();
+        } else {
+          statusEl.textContent = "값이 불완전해서 자동추가 보류(프레임에 더 정확히 맞춰보세요).";
+        }
+      } catch (e) {
+        statusEl.textContent = "OCR 오류: " + e.message;
+      } finally {
+        ocrBusy = false;
+        requestAnimationFrame(tick);
+      }
+    }
+
+    // ---- UI 핸들러 ----
+    btnStart.onclick = async () => {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" } },
+          audio: false
+        });
+        video.srcObject = stream;
+
+        btnStop.disabled = false;
+        btnToggle.disabled = false;
+        statusEl.textContent = "카메라 시작됨. ROI 프레임에 라벨 글씨를 맞추세요.";
+      } catch (e) {
+        statusEl.textContent = "카메라 접근 실패: " + e.message;
+      }
+    };
+
+    btnStop.onclick = async () => {
+      autoOn = false;
+      btnToggle.textContent = "자동인식 ON";
+      btnAdd.disabled = true;
+      btnStop.disabled = true;
+      btnToggle.disabled = true;
+
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      if (worker) {
+        await worker.terminate();
+        worker = null;
+      }
+      statusEl.textContent = "중지됨.";
+    };
+
+    btnToggle.onclick = () => {
+      autoOn = !autoOn;
+      btnToggle.textContent = autoOn ? "자동인식 OFF" : "자동인식 ON";
+      statusEl.textContent = autoOn ? "자동 인식 시작…" : "자동 인식 일시정지.";
+      if (autoOn) requestAnimationFrame(tick);
+    };
+
+    btnAdd.onclick = () => addRowFromLive();
+
+    // 셀 복사 버튼(이벤트 위임)
+    document.addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("button[data-copy]");
+      if (!btn) return;
+      const val = btn.getAttribute("data-copy") || "";
+      try {
+        await navigator.clipboard.writeText(val);
+        statusEl.textContent = `복사됨: ${val}`;
+      } catch {
+        statusEl.textContent = "복사 실패(브라우저 권한/HTTPS 확인).";
+      }
+    });
+
+    btnCopyRow.onclick = async () => {
+      if (!rows.length) return;
+      const r = rows[rows.length-1];
+      // 엑셀에 붙여넣기 좋은 TSV
+      const tsv = [r.serial, r.capacity, r.partNumber, r.timestamp].join("\t");
+      try {
+        await navigator.clipboard.writeText(tsv);
+        statusEl.textContent = "마지막 행(TSV) 복사됨. 엑셀에 붙여넣으세요.";
+      } catch {
+        statusEl.textContent = "복사 실패(HTTPS/권한 확인).";
+      }
+    };
+
+    btnDownload.onclick = () => {
+      if (!rows.length) return;
+
+      const wsData = [
+        ["Serial Number", "Capacity", "Part Number", "Timestamp"],
+        ...rows.map(r => [r.serial, r.capacity, r.partNumber, r.timestamp])
+      ];
+
+      const wb = XLSX.utils.book_new();
+      const ws = XLSX.utils.aoa_to_sheet(wsData);
+      XLSX.utils.book_append_sheet(wb, ws, "SSD");
+
+      const filename = `ssd_ocr_${new Date().toISOString().slice(0,10)}.xlsx`;
+      XLSX.writeFile(wb, filename);
+      statusEl.textContent = "엑셀 파일 다운로드 완료.";
+    };
+
+    btnClear.onclick = () => {
+      rows.length = 0;
+      tbody.innerHTML = "";
+      btnDownload.disabled = true;
+      btnCopyRow.disabled = true;
+      statusEl.textContent = "전체 삭제됨.";
+    };
+
+    // 초기 렌더
+    renderLive();
+  </script>
+</body>
+</html>
