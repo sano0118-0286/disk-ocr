@@ -161,7 +161,7 @@
     // ✅ 자동추가 안정화 파라미터
     const OCR_INTERVAL_MS = 1600;          // OCR 실행 간격
     const AUTO_ADD_COOLDOWN_MS = 2500;     // ✅ 자동 추가 후 쿨다운(연속 누적 방지)
-    const MIN_CONFIDENCE = 60;             // ✅ 변별력: 신뢰도 낮으면 자동추가 금지(수치 조절 가능)
+    const MIN_CONFIDENCE = 35;             // ✅ 변별력: 신뢰도 낮으면 자동추가 금지(수치 조절 가능)
     const STABLE_HITS_REQUIRED = 2;        // ✅ 같은 결과 2번 연속이면 "확정"
 
     let lastAutoAddAt = 0;                 // 마지막 자동추가 시각
